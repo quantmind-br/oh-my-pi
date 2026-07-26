@@ -136,6 +136,76 @@ describe("CursorExecHandlers error results", () => {
 	});
 });
 
+describe("CursorExecHandlers cancellation", () => {
+	it("forwards the request signal into tool execution", async () => {
+		const controller = new AbortController();
+		let receivedSignal: AbortSignal | undefined;
+		const started = Promise.withResolvers<void>();
+		const tool: AgentTool = {
+			name: "read",
+			label: "read",
+			description: "waits for cancellation",
+			parameters: type({}),
+			async execute(_toolCallId, _args, signal) {
+				receivedSignal = signal;
+				started.resolve();
+				await new Promise<void>((_resolve, reject) => {
+					signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+				});
+				return { content: [{ type: "text", text: "unreachable" }], details: {} };
+			},
+		};
+		const handlers = new CursorExecHandlers({ cwd: ".", tools: new Map([["read", tool]]) });
+		const execution = handlers.read(
+			create(ReadArgsSchema, { toolCallId: "call-cancel", path: "ignored" }),
+			controller.signal,
+		);
+		await started.promise;
+		controller.abort(new Error("cancel tool"));
+
+		await expect(execution).rejects.toThrow("cancel tool");
+		expect(receivedSignal).toBe(controller.signal);
+	});
+
+	it("suppresses shell stream updates after cancellation", async () => {
+		const controller = new AbortController();
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const events: AgentEvent[] = [];
+		const stdout: string[] = [];
+		const tool: AgentTool = {
+			name: "bash",
+			label: "bash",
+			description: "ignores cancellation and emits late output",
+			parameters: type({}),
+			async execute(_toolCallId, _args, _signal, onUpdate) {
+				started.resolve();
+				await release.promise;
+				onUpdate?.({ content: [{ type: "text", text: "late" }], details: {} });
+				return { content: [{ type: "text", text: "late" }], details: {} };
+			},
+		};
+		const handlers = new CursorExecHandlers({
+			cwd: ".",
+			tools: new Map([["bash", tool]]),
+			emitEvent: event => events.push(event),
+		});
+		const execution = handlers.shellStream(
+			create(ShellArgsSchema, { toolCallId: "call-shell-cancel", command: "ignored" }),
+			{ onStdout: data => stdout.push(data), onStderr: () => {} },
+			controller.signal,
+		);
+		await started.promise;
+		controller.abort(new Error("cancel shell"));
+		release.resolve();
+
+		await expect(execution).rejects.toThrow("cancel shell");
+		expect(stdout).toEqual([]);
+		expect(events.filter(event => event.type === "tool_execution_update")).toHaveLength(0);
+		expect(events.filter(event => event.type === "tool_execution_end")).toHaveLength(0);
+	});
+});
+
 describe("CursorExecHandlers mounted tool bridge", () => {
 	it("executes MCP tools resolved from the xd:// registry", async () => {
 		const mountedTool: AgentTool = {

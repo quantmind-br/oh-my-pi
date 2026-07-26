@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
 	type BlockState,
+	handleServerMessage,
 	processInteractionUpdate,
 	type ToolCallState,
 	type UsageState,
@@ -842,6 +843,77 @@ describe("cursor native todo bridge (wire-encoded protobuf)", () => {
 		const h = drive(updateCall(items([["1", "task", 3]]), 1));
 
 		expect(h.toolResults[0]).toMatchObject({ content: [{ type: "text", text: "host result" }] });
+	});
+
+	it("awaits an async host result sink before completing the todo update", async () => {
+		const h = newHarness();
+		const gate = Promise.withResolvers<void>();
+		let persisted = false;
+		h.state.onToolResult = async result => {
+			await gate.promise;
+			h.toolResults.push(result);
+			persisted = true;
+			return result;
+		};
+		const toolCall = updateCall(items([["1", "task", 3]]), 1);
+		processInteractionUpdate(
+			wireUpdate("toolCallStarted", toolCall) as never,
+			h.output,
+			h.stream,
+			h.state,
+			h.usageState,
+		);
+		const completion = processInteractionUpdate(
+			wireUpdate("toolCallCompleted", toolCall) as never,
+			h.output,
+			h.stream,
+			h.state,
+			h.usageState,
+		);
+		expect(persisted).toBe(false);
+		gate.resolve();
+		await completion;
+		expect(persisted).toBe(true);
+		expect(h.toolResults).toHaveLength(1);
+	});
+
+	it("aborts a non-cooperative async host result sink", async () => {
+		const h = newHarness();
+		const controller = new AbortController();
+		h.state.onToolResult = async () => await new Promise<never>(() => {});
+		const toolCall = updateCall(items([["1", "task", 3]]), 1);
+		await processInteractionUpdate(
+			wireUpdate("toolCallStarted", toolCall) as never,
+			h.output,
+			h.stream,
+			h.state,
+			h.usageState,
+			controller.signal,
+		);
+		const server = create(AgentServerMessageSchema, {
+			message: {
+				case: "interactionUpdate",
+				value: wireUpdate("toolCallCompleted", toolCall) as never,
+			},
+		});
+		const h2Request = { write: () => true } as unknown as Parameters<typeof handleServerMessage>[5];
+		const dispatch = handleServerMessage(
+			server,
+			h.output,
+			h.stream,
+			h.state,
+			new Map(),
+			h2Request,
+			undefined,
+			undefined,
+			h.usageState,
+			[],
+			undefined,
+			controller.signal,
+		);
+		controller.abort(new Error("cancel todo sink"));
+
+		await expect(dispatch).rejects.toThrow("cancel todo sink");
 	});
 
 	it("falls back to a summary-only result when no host handler is registered", () => {

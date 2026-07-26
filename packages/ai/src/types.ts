@@ -910,9 +910,12 @@ export type CursorExecHandlerResult<T> = { result: T; toolResult?: ToolResultMes
  * hook, and the `message_end` drain waits for a still-pending rewrite, so an
  * async transformer is honored even when the turn closes in the same chunk.
  * A rejecting transformer is swallowed and the reserved payload stands in.
+ * The request signal is forwarded so long-running transforms can cancel; an
+ * abort stops waiting and suppresses any later rewrite of the detached entry.
  */
 export type CursorToolResultHandler = (
 	result: ToolResultMessage,
+	signal?: AbortSignal,
 ) => ToolResultMessage | undefined | Promise<ToolResultMessage | undefined>;
 
 /**
@@ -983,18 +986,19 @@ export interface CursorShellStreamCallbacks {
 }
 
 export interface CursorExecHandlers {
-	read?: (args: ReadArgs) => Promise<CursorExecHandlerResult<ReadResult>>;
-	ls?: (args: LsArgs) => Promise<CursorExecHandlerResult<LsResult>>;
-	grep?: (args: GrepArgs) => Promise<CursorExecHandlerResult<GrepResult>>;
-	write?: (args: WriteArgs) => Promise<CursorExecHandlerResult<WriteResult>>;
-	delete?: (args: DeleteArgs) => Promise<CursorExecHandlerResult<DeleteResult>>;
-	shell?: (args: ShellArgs) => Promise<CursorExecHandlerResult<ShellResult>>;
+	read?: (args: ReadArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<ReadResult>>;
+	ls?: (args: LsArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<LsResult>>;
+	grep?: (args: GrepArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<GrepResult>>;
+	write?: (args: WriteArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<WriteResult>>;
+	delete?: (args: DeleteArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<DeleteResult>>;
+	shell?: (args: ShellArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<ShellResult>>;
 	shellStream?: (
 		args: ShellArgs,
 		callbacks: CursorShellStreamCallbacks,
+		signal?: AbortSignal,
 	) => Promise<CursorExecHandlerResult<ShellResult>>;
-	diagnostics?: (args: DiagnosticsArgs) => Promise<CursorExecHandlerResult<DiagnosticsResult>>;
-	mcp?: (call: CursorMcpCall) => Promise<CursorExecHandlerResult<McpResult>>;
+	diagnostics?: (args: DiagnosticsArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<DiagnosticsResult>>;
+	mcp?: (call: CursorMcpCall, signal?: AbortSignal) => Promise<CursorExecHandlerResult<McpResult>>;
 	/** Mirror Cursor's server-owned todo list into local session state. */
 	todoSync?: CursorTodoSyncHandler;
 	onToolResult?: CursorToolResultHandler;

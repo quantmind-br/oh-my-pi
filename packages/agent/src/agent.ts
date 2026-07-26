@@ -26,7 +26,7 @@ import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, untilAborted } from "@oh-my-pi/pi-utils";
 import {
 	abortReasonText,
 	agentLoop,
@@ -280,12 +280,11 @@ export interface AgentOptions {
 	 *
 	 * The Agent reserves the original result in its Cursor result buffer first,
 	 * then awaits this hook and patches the reserved entry in place. That keeps
-	 * the call paired even if `message_end` arrives while the Promise is still
-	 * pending, and `#emitCursorSplitAssistantMessage` waits for any transformer
-	 * still in flight before persisting, so a late rewrite is not lost. A
-	 * rejecting transformer is swallowed and the reserved payload stands in.
-	 * Hosts that only pass `cursorExecHandlers` (the coding-agent path) never
-	 * hit this hook.
+	 * the call paired if `message_end` arrives while the Promise is pending. The
+	 * request signal is forwarded; abort stops waiting, deactivates the run's
+	 * result sink, and suppresses any late patch from the abandoned transformer.
+	 * A rejecting transformer keeps the reserved payload. Hosts that only pass
+	 * `cursorExecHandlers` (the coding-agent path) never hit this hook.
 	 */
 	cursorOnToolResult?: CursorToolResultHandler;
 
@@ -341,9 +340,8 @@ interface CursorToolResultEntry {
 	toolResult: ToolResultMessage;
 	/**
 	 * Set while an async `cursorOnToolResult` transformer is still running for
-	 * this entry, and cleared once it settles. The drain awaits it so a
-	 * transformer that rewrites the payload is not silently discarded when
-	 * `message_end` lands in the same chunk as the tool result.
+	 * this entry. A normal drain awaits it; abort races the wait and the hook's
+	 * signal check prevents a late completion from patching abandoned state.
 	 */
 	pending?: Promise<void>;
 }
@@ -1134,6 +1132,8 @@ export class Agent {
 
 		// Clear Cursor tool result buffer at start of each run
 		this.#cursorToolResultBuffer = [];
+		const runSignal = this.#abortController.signal;
+		let cursorResultSinkActive = true;
 
 		const reasoning = this.#state.thinkingLevel;
 
@@ -1154,32 +1154,20 @@ export class Agent {
 		// unpaired, and `buildSessionContext` strips the whole interaction on
 		// replay. A non-Cursor provider never calls this, so the closure costs
 		// nothing.
-		const cursorOnToolResult = async (message: ToolResultMessage) => {
-			// Cursor executes tools server-side during streaming. We buffer each
-			// toolResult and emit them right after the assistant message closes
-			// (see `#emitCursorSplitAssistantMessage`), so replay receives
-			// (assistant with interleaved toolCall blocks) → results.
-			//
-			// The entry is reserved SYNCHRONOUSLY, before awaiting the optional
-			// transformer. The provider's data loop dispatches messages with
-			// `void handleServerMessage(...)`, so a `message_end` decoded from the
-			// same chunk can drain the buffer while a transformer is still pending
-			// — pushing afterwards would drop the result and strip its toolCall
-			// block as dangling on replay.
-			//
-			// The transformer's in-flight promise is recorded on the entry so the
-			// drain can await it (`#emitCursorSplitAssistantMessage`). Without
-			// that, a transformer resolving after the swap would patch a detached
-			// object while the persisted result kept the original payload — the
-			// rewrite silently lost.
+		const cursorOnToolResult = async (message: ToolResultMessage, requestSignal?: AbortSignal) => {
+			// Reserve synchronously so a same-chunk message_end cannot drain before
+			// this call is represented. This closure is run-scoped: abort deactivates
+			// it, preventing late dispatches from leaking into a later prompt.
+			if (!cursorResultSinkActive || runSignal.aborted) return message;
 			const entry: CursorToolResultEntry = { toolResult: message };
 			this.#cursorToolResultBuffer.push(entry);
 			const transform = this.#cursorOnToolResult;
 			if (transform) {
+				const signal = requestSignal ?? runSignal;
 				const pending = (async () => {
 					try {
-						const updated = await transform(message);
-						if (updated) entry.toolResult = updated;
+						const updated = await untilAborted(signal, async () => await transform(message, signal));
+						if (updated && cursorResultSinkActive && !signal.aborted) entry.toolResult = updated;
 					} catch {}
 				})();
 				entry.pending = pending;
@@ -1318,7 +1306,7 @@ export class Agent {
 						// Check if this is an assistant message with buffered Cursor tool results.
 						// If so, split the message to emit tool results at the correct position.
 						if (event.message.role === "assistant" && this.#cursorToolResultBuffer.length > 0) {
-							await this.#emitCursorSplitAssistantMessage(event.message as AssistantMessage);
+							await this.#emitCursorSplitAssistantMessage(event.message as AssistantMessage, runSignal);
 							continue; // Skip default emit - split method handles everything
 						}
 						this.#state.streamMessage = null;
@@ -1367,6 +1355,7 @@ export class Agent {
 			}
 		} catch (err) {
 			const stoppedForAbort = this.#abortController?.signal.aborted === true;
+			if (stoppedForAbort) cursorResultSinkActive = false;
 			const errorMessage = stoppedForAbort
 				? abortReasonText(this.#abortController?.signal)
 				: err instanceof Error
@@ -1375,16 +1364,16 @@ export class Agent {
 			const shouldEmitVisibleError = !stoppedForAbort;
 			const assistantPartial = partial?.role === "assistant" ? partial : undefined;
 			const hadAssistantStart = assistantPartial !== undefined;
-			// Same contract as the normal drain in `#emitCursorSplitAssistantMessage`:
-			// a transformer still in flight must be awaited before the payload is
-			// snapshotted, or its rewrite patches an entry this catch path already
-			// detached and the original is persisted instead. A provider error is
-			// exactly when a transform is most likely to be mid-flight.
-			const pendingTransforms = this.#cursorToolResultBuffer
-				.filter(entry => entry.pending !== undefined)
-				.map(entry => entry.pending);
+			// Preserve completed rewrites on provider failure. User abort instead
+			// abandons this run's buffer and must never wait on a user hook.
+			const pendingTransforms = stoppedForAbort
+				? []
+				: this.#cursorToolResultBuffer.filter(entry => entry.pending !== undefined).map(entry => entry.pending);
 			if (pendingTransforms.length > 0) await Promise.all(pendingTransforms);
-			const bufferedCursorResults = this.#cursorToolResultBuffer.map(({ toolResult }) => toolResult);
+			const bufferedCursorResults = stoppedForAbort
+				? []
+				: this.#cursorToolResultBuffer.map(({ toolResult }) => toolResult);
+			if (stoppedForAbort) this.#cursorToolResultBuffer = [];
 			const retainedToolCallIds = new Set(completedToolCallIds);
 			for (const { toolCallId } of bufferedCursorResults) retainedToolCallIds.add(toolCallId);
 			const errorMsg: AssistantMessage =
@@ -1465,6 +1454,7 @@ export class Agent {
 				this.#emit({ type: "agent_end", messages: [errorMsg] });
 			}
 		} finally {
+			cursorResultSinkActive = false;
 			this.#state.isStreaming = false;
 			this.#state.streamMessage = null;
 			this.#state.pendingToolCalls.clear();
@@ -1509,21 +1499,16 @@ export class Agent {
 	 * toolCall blocks; it also copied `preambleText` into every text block on
 	 * multi-text turns, producing duplicated text on replay.
 	 */
-	async #emitCursorSplitAssistantMessage(assistantMessage: AssistantMessage): Promise<void> {
-		// Snapshot and detach immediately so a still-pending `cursorOnToolResult`
-		// cannot push into a drained buffer. Entries already reserved stay paired
-		// with their toolCall.
+	async #emitCursorSplitAssistantMessage(assistantMessage: AssistantMessage, signal: AbortSignal): Promise<void> {
+		// Snapshot and detach immediately. A normal close waits for reserved
+		// rewrites; abort rejects the race and the run-scoped hook suppresses any
+		// later patch to these detached entries.
 		const buffer = this.#cursorToolResultBuffer;
 		this.#cursorToolResultBuffer = [];
 
-		// Await any transformer still running for a reserved entry before reading
-		// its payload. The provider dispatches with `void handleServerMessage(…)`,
-		// so a `message_end` from the same chunk can reach this point while a
-		// transformer is mid-flight; without the await its rewrite would land on
-		// the detached entry after the original was already appended and emitted.
-		// Each `pending` swallows its own rejection, so this cannot throw.
 		const pending = buffer.filter(entry => entry.pending !== undefined).map(entry => entry.pending);
-		if (pending.length > 0) await Promise.all(pending);
+		if (pending.length > 0) await untilAborted(signal, Promise.all(pending));
+		signal.throwIfAborted();
 
 		this.#state.streamMessage = null;
 		this.appendMessage(assistantMessage);

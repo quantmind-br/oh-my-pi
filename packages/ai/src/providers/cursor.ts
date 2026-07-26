@@ -136,6 +136,7 @@ import type {
 	ToolResultMessage,
 } from "../types";
 import { normalizeSystemPrompts } from "../utils";
+import { raceWithSignal } from "../utils/abort";
 import {
 	clearStreamingPartialJson,
 	kCursorExecResolved,
@@ -579,6 +580,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							usageState,
 							requestContextTools,
 							onConversationCheckpoint,
+							options?.signal,
 						).catch(error => {
 							log("error", "handleServerMessage", { error: String(error) });
 						});
@@ -678,13 +680,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			});
 			stream.end();
 		} catch (error) {
-			// Same reason as the success path: the Agent finalizes the synthesized
-			// call from this terminal error and clears its Cursor result buffer, so
-			// a handler still running would land its real result after `agent_end`
-			// and be discarded — even though the tool may already have run side
-			// effects. Wait for it first. An abort has already closed the transport,
-			// and every dispatch settles rather than hanging on it.
-			await drainInFlightDispatches();
+			// Ordinary transport failures still wait for an in-flight tool: it may
+			// already have side effects, and its real result must be paired before the
+			// terminal error reaches the Agent. Caller/provider cancellation is the
+			// exception — every dispatch races the same request signal, and waiting
+			// here would only delay cancellation behind user code that ignored it.
+			if (!options?.signal?.aborted) await drainInFlightDispatches();
 			const result = await AIError.finalize(error, { api: model.api, signal: options?.signal });
 			output.stopReason = result.stopReason;
 			output.errorStatus = result.status;
@@ -755,13 +756,14 @@ export async function handleServerMessage(
 	usageState: UsageState,
 	requestContextTools: McpToolDefinition[],
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
+	signal?: AbortSignal,
 ): Promise<void> {
 	const msgCase = msg.message.case;
 
 	log("serverMessage", msgCase, msg.message.value);
 
 	if (msgCase === "interactionUpdate") {
-		processInteractionUpdate(msg.message.value, output, stream, state, usageState);
+		await processInteractionUpdate(msg.message.value, output, stream, state, usageState, signal);
 	} else if (msgCase === "kvServerMessage") {
 		handleKvServerMessage(msg.message.value as KvServerMessage, blobStore, h2Request);
 	} else if (msgCase === "execServerMessage") {
@@ -779,6 +781,7 @@ export async function handleServerMessage(
 				output,
 				stream,
 				state,
+				signal,
 			),
 		);
 	} else if (msgCase === "conversationCheckpointUpdate") {
@@ -878,7 +881,11 @@ async function handleShellStreamArgs(
 	h2Request: http2.ClientHttp2Stream,
 	execHandlers: CursorExecHandlers | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
+	signal?: AbortSignal,
 ): Promise<void> {
+	signal?.throwIfAborted();
+	let active = true;
+	const isActive = () => active && !signal?.aborted;
 	const normalizedWorkingDirectory = args.workingDirectory || process.cwd();
 	const normalizedArgs: ShellArgs = { ...args, workingDirectory: normalizedWorkingDirectory };
 	const startTs = performance.now();
@@ -900,6 +907,10 @@ async function handleShellStreamArgs(
 	const incompleteEscapeRegex = /\x1b(|\[|\[\d*|\[\?|\[\?\d*|\]\d*;?)$/;
 
 	const flushStdout = () => {
+		if (!isActive()) {
+			stdoutBuffer = "";
+			return;
+		}
 		if (stdoutBuffer) {
 			let safeEnd = stdoutBuffer.length;
 			const match = stdoutBuffer.match(incompleteEscapeRegex);
@@ -919,6 +930,10 @@ async function handleShellStreamArgs(
 	};
 
 	const flushStderr = () => {
+		if (!isActive()) {
+			stderrBuffer = "";
+			return;
+		}
 		if (stderrBuffer) {
 			let safeEnd = stderrBuffer.length;
 			const match = stderrBuffer.match(incompleteEscapeRegex);
@@ -937,22 +952,24 @@ async function handleShellStreamArgs(
 		}
 	};
 
-	let stdoutFlushTimer: NodeJS.Timeout | null = null;
-	let stderrFlushTimer: NodeJS.Timeout | null = null;
+	let stdoutFlushTimer: NodeJS.Timeout | undefined;
+	let stderrFlushTimer: NodeJS.Timeout | undefined;
 
 	const scheduleStdoutFlush = () => {
+		if (!isActive()) return;
 		if (!stdoutFlushTimer) {
 			stdoutFlushTimer = setTimeout(() => {
-				stdoutFlushTimer = null;
+				stdoutFlushTimer = undefined;
 				flushStdout();
 			}, 100);
 		}
 	};
 
 	const scheduleStderrFlush = () => {
+		if (!isActive()) return;
 		if (!stderrFlushTimer) {
 			stderrFlushTimer = setTimeout(() => {
-				stderrFlushTimer = null;
+				stderrFlushTimer = undefined;
 				flushStderr();
 			}, 100);
 		}
@@ -960,11 +977,12 @@ async function handleShellStreamArgs(
 
 	const streamCallbacks: CursorShellStreamCallbacks = {
 		onStdout(data: string) {
+			if (!isActive()) return;
 			stdoutBuffer += data;
 			if (stdoutBuffer.includes("\n") || stdoutBuffer.length > 4096) {
 				if (stdoutFlushTimer) {
 					clearTimeout(stdoutFlushTimer);
-					stdoutFlushTimer = null;
+					stdoutFlushTimer = undefined;
 				}
 				flushStdout();
 			} else {
@@ -972,11 +990,12 @@ async function handleShellStreamArgs(
 			}
 		},
 		onStderr(data: string) {
+			if (!isActive()) return;
 			stderrBuffer += data;
 			if (stderrBuffer.includes("\n") || stderrBuffer.length > 4096) {
 				if (stderrFlushTimer) {
 					clearTimeout(stderrFlushTimer);
-					stderrFlushTimer = null;
+					stderrFlushTimer = undefined;
 				}
 				flushStderr();
 			} else {
@@ -989,38 +1008,52 @@ async function handleShellStreamArgs(
 	// Falls back to the batch shell handler otherwise.
 	const streamHandler = execHandlers?.shellStream?.bind(execHandlers);
 	const batchHandler = execHandlers?.shell?.bind(execHandlers);
-	const handler = streamHandler ? (shellArgs: ShellArgs) => streamHandler(shellArgs, streamCallbacks) : batchHandler;
+	const handler = streamHandler
+		? (shellArgs: ShellArgs, requestSignal?: AbortSignal) => streamHandler(shellArgs, streamCallbacks, requestSignal)
+		: batchHandler;
 
-	const { execResult } = await resolveExecHandler(
-		args as any,
-		handler as typeof batchHandler,
-		onToolResult,
-		toolResult => buildShellResultFromToolResult(normalizedArgs as any, toolResult),
-		reason =>
-			buildShellRejectedResult((normalizedArgs as any).command, (normalizedArgs as any).workingDirectory, reason),
-		error =>
-			buildShellFailureResult((normalizedArgs as any).command, (normalizedArgs as any).workingDirectory, error),
-		{ toolCallId: args.toolCallId, toolName: "bash" },
-	);
+	try {
+		const { execResult } = await resolveExecHandler(
+			args,
+			handler,
+			onToolResult,
+			toolResult => buildShellResultFromToolResult(normalizedArgs, toolResult),
+			reason => buildShellRejectedResult(normalizedArgs.command, normalizedArgs.workingDirectory, reason),
+			error => buildShellFailureResult(normalizedArgs.command, normalizedArgs.workingDirectory, error),
+			{ toolCallId: args.toolCallId, toolName: "bash" },
+			signal,
+		);
+		signal?.throwIfAborted();
 
-	// When using the batch handler (no shellStream), send buffered stdout/stderr
-	// after execution completes. With shellStream these were already sent in real time.
-	const sendBufferedOutput = !streamHandler;
-	const sanitizedExecResult = sanitizeShellExecResult(execResult);
+		// When using the batch handler (no shellStream), send buffered stdout/stderr
+		// after execution completes. With shellStream these were already sent in real time.
+		const sendBufferedOutput = !streamHandler;
+		const sanitizedExecResult = sanitizeShellExecResult(execResult);
 
-	// Flush any remaining buffered output before sending results
-	if (stdoutFlushTimer) clearTimeout(stdoutFlushTimer);
-	if (stderrFlushTimer) clearTimeout(stderrFlushTimer);
-	flushStdout();
-	flushStderr();
+		// Flush any remaining buffered output before sending results.
+		clearTimeout(stdoutFlushTimer);
+		clearTimeout(stderrFlushTimer);
+		stdoutFlushTimer = undefined;
+		stderrFlushTimer = undefined;
+		flushStdout();
+		flushStderr();
 
-	sendShellStreamExitFromResult(h2Request, execMsg, sanitizedExecResult, sendBufferedOutput);
-	// Cursor can keep the turn pending when it receives only stream deltas.
-	// Send the final structured shellResult as completion acknowledgement.
-	sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
-	sendExecClientStreamClose(h2Request, execMsg);
+		sendShellStreamExitFromResult(h2Request, execMsg, sanitizedExecResult, sendBufferedOutput);
+		// Cursor can keep the turn pending when it receives only stream deltas.
+		// Send the final structured shellResult as completion acknowledgement.
+		sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
+		sendExecClientStreamClose(h2Request, execMsg);
 
-	log("shellStream", "done", { elapsed: performance.now() - startTs });
+		log("shellStream", "done", { elapsed: performance.now() - startTs });
+	} finally {
+		active = false;
+		clearTimeout(stdoutFlushTimer);
+		clearTimeout(stderrFlushTimer);
+		stdoutFlushTimer = undefined;
+		stderrFlushTimer = undefined;
+		stdoutBuffer = "";
+		stderrBuffer = "";
+	}
 }
 
 function sendShellStreamExitFromResult(
@@ -1140,6 +1173,7 @@ async function handleExecServerMessage(
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 	state: BlockState,
+	signal?: AbortSignal,
 ): Promise<void> {
 	const execCase = execMsg.message.case;
 	log("exec", "dispatch", { execCase, execId: execMsg.execId, hasHandlers: !!execHandlers });
@@ -1184,6 +1218,7 @@ async function handleExecServerMessage(
 				reason => buildReadRejectedResult(args.path, reason),
 				error => buildReadErrorResult(args.path, error),
 				{ toolCallId: args.toolCallId, toolName: "read" },
+				signal,
 			);
 			sendExecClientMessage(h2Request, execMsg, "readResult", execResult);
 			return;
@@ -1203,6 +1238,7 @@ async function handleExecServerMessage(
 				reason => buildLsRejectedResult(args.path, reason),
 				error => buildLsErrorResult(args.path, error),
 				{ toolCallId: args.toolCallId, toolName: "read" },
+				signal,
 			);
 			sendExecClientMessage(h2Request, execMsg, "lsResult", execResult);
 			return;
@@ -1238,6 +1274,7 @@ async function handleExecServerMessage(
 				reason => buildGrepErrorResult(reason),
 				error => buildGrepErrorResult(error),
 				{ toolCallId: args.toolCallId, toolName: "grep" },
+				signal,
 			);
 			sendExecClientMessage(h2Request, execMsg, "grepResult", execResult);
 			return;
@@ -1268,6 +1305,7 @@ async function handleExecServerMessage(
 				reason => buildWriteRejectedResult(args.path, reason),
 				error => buildWriteErrorResult(args.path, error),
 				{ toolCallId: args.toolCallId, toolName: "write" },
+				signal,
 			);
 			sendExecClientMessage(h2Request, execMsg, "writeResult", execResult);
 			return;
@@ -1284,6 +1322,7 @@ async function handleExecServerMessage(
 				reason => buildDeleteRejectedResult(args.path, reason),
 				error => buildDeleteErrorResult(args.path, error),
 				{ toolCallId: args.toolCallId, toolName: "delete" },
+				signal,
 			);
 			sendExecClientMessage(h2Request, execMsg, "deleteResult", execResult);
 			return;
@@ -1308,6 +1347,7 @@ async function handleExecServerMessage(
 				reason => buildShellRejectedResult(normalizedArgs.command, normalizedArgs.workingDirectory, reason),
 				error => buildShellFailureResult(normalizedArgs.command, normalizedArgs.workingDirectory, error),
 				{ toolCallId: args.toolCallId, toolName: "bash" },
+				signal,
 			);
 			const sanitizedExecResult = sanitizeShellExecResult(execResult);
 			sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
@@ -1322,7 +1362,7 @@ async function handleExecServerMessage(
 				cwd: args.workingDirectory || undefined,
 				timeout: shellStreamTimeout,
 			});
-			await handleShellStreamArgs(args, execMsg, h2Request, execHandlers, onToolResult);
+			await handleShellStreamArgs(args, execMsg, h2Request, execHandlers, onToolResult, signal);
 			return;
 		}
 		case "backgroundShellSpawnArgs": {
@@ -1384,6 +1424,7 @@ async function handleExecServerMessage(
 				reason => buildDiagnosticsRejectedResult(args.path, reason),
 				error => buildDiagnosticsErrorResult(args.path, error),
 				{ toolCallId: args.toolCallId, toolName: "lsp" },
+				signal,
 			);
 			sendExecClientMessage(h2Request, execMsg, "diagnosticsResult", execResult);
 			return;
@@ -1406,6 +1447,7 @@ async function handleExecServerMessage(
 				_reason => buildMcpToolNotFoundResult(mcpCall),
 				error => buildMcpErrorResult(error),
 				execHandlers?.mcp ? { toolCallId: mcpCall.toolCallId, toolName: mcpCall.toolName } : null,
+				signal,
 			);
 			sendExecClientMessage(h2Request, execMsg, "mcpResult", execResult);
 			return;
@@ -1505,12 +1547,13 @@ function sendExecClientStreamClose(h2Request: http2.ClientHttp2Stream, execMsg: 
  */
 export async function resolveExecHandler<TArgs, TResult>(
 	args: TArgs,
-	handler: ((args: TArgs) => Promise<CursorExecHandlerResult<TResult>>) | undefined,
+	handler: ((args: TArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<TResult>>) | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
 	buildFromToolResult: (toolResult: ToolResultMessage) => TResult,
 	buildRejected: (reason: string) => TResult,
 	buildError: (error: string) => TResult,
 	pairing: CursorExecPairing | null,
+	signal?: AbortSignal,
 ): Promise<{ execResult: TResult; toolResult?: ToolResultMessage }> {
 	const pair = async (text: string, isError: boolean): Promise<ToolResultMessage | undefined> => {
 		// `null` only for MCP without a handler: that block is never marked
@@ -1525,7 +1568,7 @@ export async function resolveExecHandler<TArgs, TResult>(
 			isError,
 			timestamp: Date.now(),
 		};
-		return await applyToolResultHandler(synthesized, onToolResult);
+		return await applyToolResultHandler(synthesized, onToolResult, signal);
 	};
 
 	if (!handler) {
@@ -1534,9 +1577,10 @@ export async function resolveExecHandler<TArgs, TResult>(
 	}
 
 	try {
-		const handlerResult = await handler(args);
+		signal?.throwIfAborted();
+		const handlerResult = await raceWithSignal(handler(args, signal), signal);
 		const { execResult, toolResult } = splitExecHandlerResult(handlerResult);
-		const finalToolResult = await applyToolResultHandler(toolResult, onToolResult);
+		const finalToolResult = await applyToolResultHandler(toolResult, onToolResult, signal);
 
 		if (execResult) {
 			// TResult-only is a supported return form, so the transcript entry has to
@@ -1555,6 +1599,7 @@ export async function resolveExecHandler<TArgs, TResult>(
 		const reason = "Tool returned no result";
 		return { execResult: buildRejected(reason), toolResult: await pair(reason, true) };
 	} catch (error) {
+		if (signal?.aborted) throw signal.reason ?? new AIError.AbortError();
 		const message = error instanceof Error ? error.message : String(error);
 		return { execResult: buildError(message), toolResult: await pair(message, true) };
 	}
@@ -1646,11 +1691,13 @@ function isToolResultMessage(value: unknown): value is ToolResultMessage {
 async function applyToolResultHandler(
 	toolResult: ToolResultMessage | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
+	signal?: AbortSignal,
 ): Promise<ToolResultMessage | undefined> {
 	if (!toolResult || !onToolResult) {
 		return toolResult;
 	}
-	const updated = await onToolResult(toolResult);
+	signal?.throwIfAborted();
+	const updated = await raceWithSignal(Promise.resolve(onToolResult(toolResult, signal)), signal);
 	return updated ?? toolResult;
 }
 
@@ -2599,21 +2646,26 @@ export function synthesizeCursorExecToolCall(
 	stream.push({ type: "toolcall_end", contentIndex: idx, toolCall: block, partial: output });
 }
 
-/** Exported for tests: drives one Cursor interaction update through the streaming state machine. */
 export function processInteractionUpdate(
-	update: any,
+	update: unknown,
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 	state: BlockState,
 	usageState: UsageState,
-): void {
-	const updateCase = update.message?.case;
+	signal?: AbortSignal,
+): void | Promise<void> {
+	let pendingToolResult: Promise<void> | undefined;
+	// Production passes a protobuf-decoded InteractionUpdate. Tests also exercise
+	// compatibility with equivalent hand-shaped fixtures.
+	const message = (update as { message?: { case?: string; value?: unknown } } | null)?.message;
+	const updateCase = message?.case;
+	const updateValue = message?.value as Record<string, unknown> | undefined;
 
-	log("interactionUpdate", updateCase, update.message?.value);
+	log("interactionUpdate", updateCase, updateValue);
 
 	if (updateCase === "textDelta") {
 		state.setFirstTokenTime();
-		const delta = update.message.value.text || "";
+		const delta = typeof updateValue?.text === "string" ? updateValue.text : "";
 		if (!state.currentTextBlock) {
 			const block: TextContent & { [kStreamingBlockIndex]: number } = {
 				type: "text",
@@ -2629,7 +2681,7 @@ export function processInteractionUpdate(
 		stream.push({ type: "text_delta", contentIndex: idx, delta, partial: output });
 	} else if (updateCase === "thinkingDelta") {
 		state.setFirstTokenTime();
-		const delta = update.message.value.text || "";
+		const delta = typeof updateValue?.text === "string" ? updateValue.text : "";
 		if (!state.currentThinkingBlock) {
 			const block: ThinkingContent & { [kStreamingBlockIndex]: number } = {
 				type: "thinking",
@@ -2648,7 +2700,7 @@ export function processInteractionUpdate(
 	} else if (updateCase === "toolCallStarted") {
 		endCurrentTextBlock(output, stream, state);
 		endCurrentThinkingBlock(output, stream, state);
-		const toolCall = update.message.value.toolCall;
+		const toolCall = updateValue?.toolCall;
 		if (toolCall) {
 			const mcpCall = selectMcpCall(toolCall);
 			if (mcpCall) {
@@ -2683,7 +2735,7 @@ export function processInteractionUpdate(
 			// the server's success snapshot only.
 			const todoCalls = selectTodoCalls(toolCall);
 			if (todoCalls.update || todoCalls.read) {
-				const callId = update.message.value.callId || crypto.randomUUID();
+				const callId = typeof updateValue?.callId === "string" ? updateValue.callId : crypto.randomUUID();
 				const block: ToolCallState = {
 					type: "toolCall",
 					id: callId,
@@ -2704,7 +2756,7 @@ export function processInteractionUpdate(
 			// delta is a cumulative snapshot of the JSON-text args. Strip the prefix we already
 			// have to recover the new suffix; fall back to treating the value as an incremental
 			// fragment when it doesn't extend the buffer.
-			const snapshot: string = update.message.value.argsTextDelta || "";
+			const snapshot = typeof updateValue?.argsTextDelta === "string" ? updateValue.argsTextDelta : "";
 			const current = state.currentToolCall[kStreamingPartialJson] ?? "";
 			const chunk = snapshot.startsWith(current) ? snapshot.slice(current.length) : snapshot;
 			if (chunk.length === 0) {
@@ -2725,7 +2777,7 @@ export function processInteractionUpdate(
 		}
 	} else if (updateCase === "toolCallCompleted") {
 		if (state.currentToolCall) {
-			const toolCall = update.message.value.toolCall;
+			const toolCall = updateValue?.toolCall as CursorMcpToolCallCarrier | CursorTodoToolCall | undefined;
 			if (state.currentToolCall[kStreamingBlockKind] === "mcp") {
 				// Authoritative full parse of the accumulated argument buffer; the delta
 				// path throttles mid-stream parses, so `arguments` may lag the buffer.
@@ -2765,8 +2817,13 @@ export function processInteractionUpdate(
 				// carries the `details.phases` the todo renderer replays the list
 				// from — with the provider's summary standing in when the host has
 				// nothing to add.
+				signal?.throwIfAborted();
 				const persisted = state.onTodoSnapshot?.(snapshot, state.currentToolCall.id, error) ?? undefined;
-				state.onToolResult?.(persisted ?? buildTodoToolResult(state.currentToolCall.id, snapshot, error));
+				const result = state.onToolResult?.(
+					persisted ?? buildTodoToolResult(state.currentToolCall.id, snapshot, error),
+					signal,
+				);
+				if (result) pendingToolResult = raceWithSignal(Promise.resolve(result), signal).then(() => {});
 			}
 			const idx = output.content.indexOf(state.currentToolCall);
 			clearStreamingPartialJson(state.currentToolCall);
@@ -2776,11 +2833,13 @@ export function processInteractionUpdate(
 	} else if (updateCase === "turnEnded") {
 		output.stopReason = "stop";
 	} else if (updateCase === "tokenDelta") {
-		const tokenDelta = update.message.value;
+		const tokenDelta = updateValue;
 		usageState.sawTokenDelta = true;
-		output.usage.output += tokenDelta.tokens || 0;
+		const tokens = typeof tokenDelta?.tokens === "number" ? tokenDelta.tokens : 0;
+		output.usage.output += tokens;
 		output.usage.totalTokens = output.usage.input + output.usage.output;
 	}
+	return pendingToolResult;
 }
 
 function handleConversationCheckpointUpdate(

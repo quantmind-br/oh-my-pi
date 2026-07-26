@@ -12,7 +12,14 @@ import {
 	type ToolCallState,
 } from "@oh-my-pi/pi-ai/providers/cursor";
 import { streamCursor as lazyStreamCursor, setCursorProviderModule } from "@oh-my-pi/pi-ai/providers/register-builtins";
-import type { AssistantMessage, Context, CursorExecHandlers, Model, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
+import type {
+	AssistantMessage,
+	Context,
+	CursorExecHandlers,
+	CursorShellStreamCallbacks,
+	Model,
+	ToolResultMessage,
+} from "@oh-my-pi/pi-ai/types";
 import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -31,6 +38,7 @@ import {
 	ReadRejectedSchema,
 	ReadResultSchema,
 	ReadSuccessSchema,
+	ShellArgsSchema,
 } from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
 
 const cursorModel: Model<"cursor-agent"> = buildModel({
@@ -768,6 +776,71 @@ describe("Cursor exec local-work tracking (issue #4593)", () => {
 		expect(stream.hasPendingLocalWork).toBe(false);
 		// The read result went back out on the exec channel.
 		expect(written.length).toBe(1);
+	});
+
+	it("stops provider shell stream callbacks and timers after cancellation", async () => {
+		const output = cursorAssistantMessage();
+		const stream = new AssistantMessageEventStream();
+		const state = newBlockState();
+		const writes: unknown[] = [];
+		const h2Request = {
+			write: (chunk: unknown) => {
+				writes.push(chunk);
+				return true;
+			},
+		} as unknown as Parameters<typeof handleServerMessage>[5];
+		const started = Promise.withResolvers<void>();
+		let callbacks: CursorShellStreamCallbacks | undefined;
+		const execHandlers: CursorExecHandlers = {
+			async shellStream(_args, streamCallbacks) {
+				callbacks = streamCallbacks;
+				streamCallbacks.onStdout("buffered stdout");
+				streamCallbacks.onStderr("buffered stderr");
+				started.resolve();
+				return await new Promise<never>(() => {});
+			},
+		};
+		const serverMsg = create(AgentServerMessageSchema, {
+			message: {
+				case: "execServerMessage",
+				value: create(ExecServerMessageSchema, {
+					id: 1,
+					execId: "exec-shell-stream-abort",
+					message: {
+						case: "shellStreamArgs",
+						value: create(ShellArgsSchema, {
+							command: "ignored",
+							toolCallId: "call-shell-stream-abort",
+						}),
+					},
+				}),
+			},
+		});
+		const controller = new AbortController();
+		const dispatch = handleServerMessage(
+			serverMsg,
+			output,
+			stream,
+			state,
+			new Map(),
+			h2Request,
+			execHandlers,
+			undefined,
+			{ sawTokenDelta: false },
+			[],
+			undefined,
+			controller.signal,
+		);
+		await started.promise;
+		expect(writes).toHaveLength(1);
+
+		controller.abort(new Error("cancel shell stream"));
+		await expect(dispatch).rejects.toThrow("cancel shell stream");
+		await Bun.sleep(150);
+		callbacks?.onStdout("late stdout\n");
+		callbacks?.onStderr("late stderr\n");
+
+		expect(writes).toHaveLength(1);
 	});
 
 	it("marks an MCP call as resolved before its streamed block arrives", async () => {

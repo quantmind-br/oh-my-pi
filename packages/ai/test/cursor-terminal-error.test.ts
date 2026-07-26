@@ -22,6 +22,7 @@ type Scenario =
 	| { kind: "end-before-turn" }
 	| { kind: "hang-after-turn" }
 	| { kind: "exec-in-final-chunk"; responseFinished: PromiseWithResolvers<void> }
+	| { kind: "exec-then-hang" }
 	| { kind: "exec-then-transport-error"; responseFinished: PromiseWithResolvers<void> };
 
 let server: http2.Http2Server | undefined;
@@ -156,6 +157,11 @@ async function startServer(): Promise<string> {
 			stream.on("finish", () => responseFinished.resolve());
 			stream.write(execAndTurnEndedFrame());
 			stream.end();
+			return;
+		}
+
+		if (scenario.kind === "exec-then-hang") {
+			stream.write(execRequestFrame());
 			return;
 		}
 
@@ -313,6 +319,42 @@ describe("Cursor terminal lifecycle after turnEnded", () => {
 		expect(eventTypes.at(-1)).toBe("error");
 		expect(eventTypes).not.toContain("done");
 		expect(result.stopReason).toBe("aborted");
+	});
+
+	it("aborts while an exec handler ignores cancellation", async () => {
+		scenario = { kind: "exec-then-hang" };
+		const baseUrl = await startServer();
+		const controller = new AbortController();
+		const handlerStarted = Promise.withResolvers<AbortSignal | undefined>();
+		const stream = streamCursor(makeModel(baseUrl), context, {
+			apiKey: "test-token",
+			signal: controller.signal,
+			execHandlers: {
+				async read(_args, signal) {
+					handlerStarted.resolve(signal);
+					return await new Promise<never>(() => {});
+				},
+			},
+		});
+		const eventTypes: string[] = [];
+		const consume = (async () => {
+			for await (const event of stream) eventTypes.push(event.type);
+			return await stream.result();
+		})();
+
+		const handlerSignal = await handlerStarted.promise;
+		controller.abort(new Error("cancel exec"));
+		const outcome = await Promise.race([
+			consume.then(result => ({ kind: "result" as const, result })),
+			Bun.sleep(100).then(() => ({ kind: "timeout" as const })),
+		]);
+
+		expect(outcome.kind).toBe("result");
+		if (outcome.kind !== "result") return;
+		expect(handlerSignal).toBe(controller.signal);
+		expect(eventTypes.at(-1)).toBe("error");
+		expect(eventTypes).not.toContain("done");
+		expect(outcome.result.stopReason).toBe("aborted");
 	});
 
 	it("waits for an exec handler decoded from the final chunk before done", async () => {

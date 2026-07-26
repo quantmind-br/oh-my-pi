@@ -558,6 +558,71 @@ describe("Agent", () => {
 		});
 	});
 
+	it("aborts without waiting for a pending Cursor result transformer", async () => {
+		const mock = createMockModel({ responses: [] });
+		const toolCall = {
+			type: "toolCall" as const,
+			id: "cursor-tool-abort",
+			name: "shell",
+			arguments: { command: "pwd" },
+			[kCursorExecResolved]: true,
+		};
+		const started = createAssistantMessage([toolCall]);
+		const realToolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			content: [{ type: "text", text: "original" }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		const transformStarted = Promise.withResolvers<AbortSignal | undefined>();
+		const transformGate = Promise.withResolvers<void>();
+		let streamCall = 0;
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			cursorOnToolResult: async (message, signal) => {
+				transformStarted.resolve(signal);
+				await transformGate.promise;
+				return { ...message, content: [{ type: "text" as const, text: "late transform" }] };
+			},
+			streamFn: (_model, _context, options) => {
+				const stream = new AssistantMessageEventStream();
+				streamCall++;
+				queueMicrotask(() => {
+					if (streamCall === 1) {
+						void options?.cursorOnToolResult?.(realToolResult, options.signal);
+						stream.push({ type: "start", partial: started });
+						stream.push({ type: "done", reason: "stop", message: started });
+						return;
+					}
+					const completed = createAssistantMessage([{ type: "text", text: "second run" }]);
+					stream.push({ type: "start", partial: completed });
+					stream.push({ type: "done", reason: "stop", message: completed });
+				});
+				return stream;
+			},
+		});
+
+		const firstTurn = agent.prompt("trigger");
+		const signal = await transformStarted.promise;
+		agent.abort(new Error("cancel transform"));
+		const outcome = await Promise.race([
+			firstTurn.then(
+				() => "settled",
+				() => "settled",
+			),
+			Bun.sleep(100).then(() => "timeout"),
+		]);
+		expect(outcome).toBe("settled");
+		expect(signal?.aborted).toBe(true);
+
+		transformGate.resolve();
+		await Bun.sleep(0);
+		await agent.prompt("second");
+		expect(agent.state.messages.filter(message => message.role === "toolResult")).toHaveLength(0);
+	});
+
 	it("prompt() finalizes an existing assistant stream for Anthropic output-blocked stream errors", async () => {
 		const mock = createMockModel({ responses: [] });
 		const errorText = "Output blocked by content filtering policy";
